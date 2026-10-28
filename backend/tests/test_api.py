@@ -341,6 +341,18 @@ def test_flagged_outcome_and_lecturer_review(client: TestClient, fake_engine: Fa
     t_token, _ = login(client, "teacher@demo.edu", "teacher")
     s_token, student2 = login(client, "student2@demo.edu", "student")
 
+    # Enroll student reference selfie (check-in requires an enrolled reference)
+    fake_engine.preset_detections = [
+        FaceDetection(bbox_x=120, bbox_y=80, bbox_w=60, bbox_h=80, confidence=0.98, ipd_px=22.0),
+    ]
+    enroll = client.post(
+        "/api/auth/enroll",
+        headers=auth_hdr(s_token),
+        data={"consent": "true"},
+        files={"photo": ("selfie.jpg", make_test_frame_bytes(), "image/jpeg")},
+    )
+    assert enroll.status_code == 200, enroll.text
+
     # Create session
     sess = client.post(
         "/api/sessions",

@@ -429,8 +429,8 @@ def test_privacy_biometric_right_to_deletion_roundtrip():
     tmpl = db.table("face_templates").select("id").eq("user_id", STUDENT_ID).execute().data
     assert len(tmpl) == 0, "Biometric template was not erased from database!"
 
-    prof = db.table("profiles").select("registration_locked").eq("id", STUDENT_ID).single().execute().data
-    assert prof["registration_locked"] is False
+    profs = db.table("profiles").select("registration_locked").eq("id", STUDENT_ID).execute().data
+    assert profs and all(p["registration_locked"] is False for p in profs)
 
     # 4. Status is now unenrolled
     st_resp2 = client.get("/api/auth/enrollment-status", headers={"Authorization": f"Bearer {token}"})

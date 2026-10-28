@@ -37,6 +37,14 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class SingleRowError(Exception):
+    """Raised by ``single()`` when a query does not return exactly one row.
+
+    Mirrors PostgREST, which answers ``single()`` with HTTP 406 / ``APIError``
+    when zero or multiple rows match.
+    """
+
+
 class MockResponse:
     def __init__(self, data: Any = None, count: Optional[int] = None):
         self.data = data
@@ -170,7 +178,11 @@ class InMemoryTableQuery:
             matched = matched[:self._limit_val]
 
         if self._single_mode:
-            return MockResponse(data=matched[0] if matched else None, count=count)
+            if len(matched) != 1:
+                raise SingleRowError(
+                    f"single() expected exactly 1 row from '{self.table_name}', got {len(matched)}"
+                )
+            return MockResponse(data=matched[0], count=count)
 
         return MockResponse(data=matched, count=count)
 
@@ -455,12 +467,41 @@ def supa() -> Any:
                 _shared_client = _wrap_client(
                     create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
                 )
-            except Exception:
+            except Exception as exc:
+                if ATTENDANCE_ENV == "production":
+                    raise RuntimeError(f"Supabase client initialisation failed: {exc}") from exc
+                logger.error(
+                    "Supabase client initialisation failed (%s); using non-persistent in-memory database.",
+                    exc,
+                )
                 _shared_client = _wrap_client(get_in_memory_db())
         else:
+            if ATTENDANCE_ENV == "production":
+                raise RuntimeError(
+                    "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be configured in production; "
+                    "refusing to store attendance in the non-persistent in-memory database."
+                )
+            logger.warning("Supabase is not configured; using non-persistent in-memory database.")
             _shared_client = _wrap_client(get_in_memory_db())
 
     return _shared_client
+
+
+def is_supabase_backend() -> bool:
+    """True when requests are served by a real Supabase project (not the in-memory DB)."""
+    client = supa()
+    inner = getattr(client, "_client", client)
+    return not isinstance(inner, InMemoryDatabase)
+
+
+def first_row(query: Any) -> Optional[dict[str, Any]]:
+    """Execute ``query`` and return its first row, or ``None`` when nothing matches.
+
+    Use instead of ``single()``, which raises on zero rows with PostgREST.
+    """
+    resp = query.limit(1).execute()
+    rows = resp.data or []
+    return rows[0] if rows else None
 
 
 def reset_test_db() -> InMemoryDatabase:
