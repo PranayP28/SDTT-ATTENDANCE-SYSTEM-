@@ -67,6 +67,13 @@ STARTUP_DB_PROBE_TIMEOUT_S = float(os.getenv("ATTENDANCE_STARTUP_DB_PROBE_TIMEOU
 ENABLE_REQUEST_TIMING = os.getenv("ATTENDANCE_ENABLE_REQUEST_TIMING", "1") == "1"
 ENABLE_DB_TIMING = os.getenv("ATTENDANCE_ENABLE_DB_TIMING", "1") == "1"
 DB_SLOW_QUERY_MS = float(os.getenv("ATTENDANCE_DB_SLOW_QUERY_MS", "250.0"))
+# Load ONNX face models in a background thread at startup so the first
+# verification request does not pay model initialisation latency.
+PRELOAD_FACE_ENGINE = os.getenv(
+    "ATTENDANCE_PRELOAD_FACE_ENGINE", "0" if ATTENDANCE_ENV == "test" else "1"
+) == "1"
+DEFAULT_PAGE_SIZE = int(os.getenv("ATTENDANCE_DEFAULT_PAGE_SIZE", "100"))
+MAX_PAGE_SIZE = int(os.getenv("ATTENDANCE_MAX_PAGE_SIZE", "500"))
 
 # ── Attempt Limits ────────────────────────────────────────────────────────────
 MAX_ATTEMPTS_PER_STUDENT = int(os.getenv("ATTENDANCE_MAX_ATTEMPTS", "3"))

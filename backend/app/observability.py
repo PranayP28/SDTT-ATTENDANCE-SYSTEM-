@@ -14,7 +14,9 @@ import os
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Iterator
 
 from app.config import (
@@ -29,6 +31,29 @@ inference_logger = logging.getLogger("attendrix.inference")
 
 class InferenceBusyError(RuntimeError):
     """Raised when the bounded inference queue cannot admit a request in time."""
+
+
+# Per-request counters. The middleware stores a mutable dict here; FastAPI
+# copies the context into its threadpool, so sync endpoints mutate the same dict.
+_REQUEST_METRICS: ContextVar[dict[str, float] | None] = ContextVar("attendrix_request_metrics", default=None)
+
+
+def new_request_metrics() -> dict[str, float]:
+    return {"db_calls": 0, "db_ms": 0.0, "inference_wait_ms": 0.0, "inference_ms": 0.0}
+
+
+def record_metric(name: str, value: float, *, count_key: str | None = None) -> None:
+    """Add ``value`` to the current request's metric ``name`` (no-op outside a request)."""
+    metrics = _REQUEST_METRICS.get()
+    if metrics is None:
+        return
+    metrics[name] = metrics.get(name, 0.0) + value
+    if count_key:
+        metrics[count_key] = metrics.get(count_key, 0) + 1
+
+
+def current_request_metrics() -> dict[str, float] | None:
+    return _REQUEST_METRICS.get()
 
 
 def configure_logging() -> None:
@@ -54,11 +79,11 @@ def configure_logging() -> None:
 
 def _request_id(scope: dict[str, Any]) -> str:
     headers = dict(scope.get("headers") or [])
-    for key in (b"cf-ray", b"x-request-id"):
+    for key in (b"x-request-id", b"cf-ray"):
         value = headers.get(key)
         if value:
             return value.decode("latin-1")[:128]
-    return ""
+    return uuid.uuid4().hex
 
 
 def _log_request(
@@ -68,26 +93,29 @@ def _log_request(
     status: int,
     duration_ms: float,
     request_id: str,
+    metrics: dict[str, float] | None = None,
 ) -> None:
     # Render health checks run every few seconds. Keep successful probes out of
     # the log unless they are slow enough to indicate a real problem.
     if path in ("/", "/health", "/api/health") and status < 400 and duration_ms < 1000:
         return
 
-    request_logger.info(
-        json.dumps(
-            {
-                "event": "request_complete",
-                "method": method,
-                "path": path,
-                "status": status,
-                "duration_ms": round(duration_ms, 1),
-                "cf_ray": request_id or None,
-                "pid": os.getpid(),
-            },
-            separators=(",", ":"),
-        )
-    )
+    entry: dict[str, Any] = {
+        "event": "request_complete",
+        "method": method,
+        "path": path,
+        "status": status,
+        "duration_ms": round(duration_ms, 1),
+        "request_id": request_id or None,
+        "pid": os.getpid(),
+    }
+    if metrics:
+        entry["db_calls"] = int(metrics.get("db_calls", 0))
+        entry["db_ms"] = round(metrics.get("db_ms", 0.0), 1)
+        if metrics.get("inference_ms") or metrics.get("inference_wait_ms"):
+            entry["inference_wait_ms"] = round(metrics.get("inference_wait_ms", 0.0), 1)
+            entry["inference_ms"] = round(metrics.get("inference_ms", 0.0), 1)
+    request_logger.info(json.dumps(entry, separators=(",", ":")))
 
 
 class RequestTimingMiddleware:
@@ -107,15 +135,25 @@ class RequestTimingMiddleware:
         path = scope.get("path", "")
         request_id = _request_id(scope)
         state = {"status": 500, "logged": False}
+        metrics = new_request_metrics()
+        metrics_token = _REQUEST_METRICS.set(metrics)
 
         async def send_with_timing(message: dict[str, Any]) -> None:
             if message.get("type") == "http.response.start":
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 state["status"] = int(message.get("status", 500))
                 headers = list(message.get("headers") or [])
-                headers.append(
-                    (b"server-timing", f"app;dur={elapsed_ms:.1f}".encode("ascii"))
+                timing = (
+                    f"app;dur={elapsed_ms:.1f}, "
+                    f'db;dur={metrics["db_ms"]:.1f};desc="{int(metrics["db_calls"])} queries"'
                 )
+                if metrics["inference_ms"] or metrics["inference_wait_ms"]:
+                    timing += (
+                        f', inference-queue;dur={metrics["inference_wait_ms"]:.1f}'
+                        f', inference;dur={metrics["inference_ms"]:.1f}'
+                    )
+                headers.append((b"server-timing", timing.encode("ascii")))
+                headers.append((b"x-request-id", request_id.encode("latin-1")))
                 headers.append(
                     (b"x-process-time-ms", f"{elapsed_ms:.1f}".encode("ascii"))
                 )
@@ -126,6 +164,7 @@ class RequestTimingMiddleware:
                     status=state["status"],
                     duration_ms=elapsed_ms,
                     request_id=request_id,
+                    metrics=metrics,
                 )
                 state["logged"] = True
             await send(message)
@@ -140,6 +179,7 @@ class RequestTimingMiddleware:
                     status=500,
                     duration_ms=(time.perf_counter() - started) * 1000.0,
                     request_id=request_id,
+                    metrics=metrics,
                 )
                 state["logged"] = True
             raise
@@ -152,7 +192,9 @@ class RequestTimingMiddleware:
                     status=499,
                     duration_ms=(time.perf_counter() - started) * 1000.0,
                     request_id=request_id,
+                    metrics=metrics,
                 )
+            _REQUEST_METRICS.reset(metrics_token)
 
 
 _INFERENCE_GATE = threading.BoundedSemaphore(max(1, MAX_CONCURRENT_INFERENCE))
@@ -187,6 +229,7 @@ def inference_slot(operation: str) -> Iterator[None]:
         )
 
     wait_ms = (time.perf_counter() - queued_at) * 1000.0
+    record_metric("inference_wait_ms", wait_ms)
     started = time.perf_counter()
     outcome = "ok"
     try:
@@ -195,6 +238,7 @@ def inference_slot(operation: str) -> Iterator[None]:
         outcome = "error"
         raise
     finally:
+        record_metric("inference_ms", (time.perf_counter() - started) * 1000.0)
         inference_logger.info(
             json.dumps(
                 {

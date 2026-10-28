@@ -61,6 +61,7 @@ class InMemoryTableQuery:
         self._order_col: Optional[str] = None
         self._order_desc: bool = False
         self._limit_val: Optional[int] = None
+        self._offset_val: int = 0
         self._single_mode: bool = False
         self._action = "select"
         self._write_data: Any = None
@@ -90,6 +91,12 @@ class InMemoryTableQuery:
 
     def limit(self, count: int) -> InMemoryTableQuery:
         self._limit_val = count
+        return self
+
+    def range(self, start: int, end: int) -> InMemoryTableQuery:
+        """Inclusive row window, matching PostgREST ``range(start, end)``."""
+        self._offset_val = max(0, start)
+        self._limit_val = max(0, end - start + 1)
         return self
 
     def single(self) -> InMemoryTableQuery:
@@ -174,6 +181,8 @@ class InMemoryTableQuery:
                 reverse=self._order_desc,
             )
 
+        if self._offset_val:
+            matched = matched[self._offset_val:]
         if self._limit_val is not None:
             matched = matched[:self._limit_val]
 
@@ -389,6 +398,8 @@ class _TimedQuery:
         return delegated
 
     def execute(self) -> Any:
+        from app.observability import record_metric
+
         started = time.perf_counter()
         failed = False
         try:
@@ -413,6 +424,7 @@ class _TimedQuery:
             raise
         finally:
             elapsed_ms = (time.perf_counter() - started) * 1000.0
+            record_metric("db_ms", elapsed_ms, count_key="db_calls")
             if not failed and elapsed_ms >= DB_SLOW_QUERY_MS:
                 logger.warning(
                     json.dumps(

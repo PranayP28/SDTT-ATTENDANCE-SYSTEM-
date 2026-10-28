@@ -234,7 +234,7 @@ def test_request_timing_log_has_context_but_no_query_secrets(caplog):
     assert entry["path"] == "/api/time"
     assert entry["status"] == 200
     assert isinstance(entry["duration_ms"], (int, float))
-    assert entry["cf_ray"] == "test-ray-123"
+    assert entry["request_id"] == "test-ray-123"
     assert "super-secret-query-token" not in caplog.text
     assert "access_token" not in caplog.text
 

@@ -64,6 +64,7 @@ from app.config import (
 )
 from app.db import first_row, is_supabase_backend, supa, utc_now
 from app.face_engine import FaceDetection, get_face_engine
+from app.config import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE, PRELOAD_FACE_ENGINE
 from app.observability import (
     InferenceBusyError,
     RequestTimingMiddleware,
@@ -191,6 +192,28 @@ async def _session_auto_close_loop():
             logger.error(f"Error in session auto-close loop: {exc}")
 
 
+async def _preload_face_engine() -> None:
+    """Load face models once per worker in a thread; never blocks startup or health checks."""
+    started = time.perf_counter()
+    try:
+        await asyncio.to_thread(get_face_engine)
+        logger.info(
+            f"[LIFECYCLE] face_engine_preload status=ok "
+            f"duration_ms={(time.perf_counter() - started) * 1000.0:.1f}"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning(f"[LIFECYCLE] face_engine_preload status=error error={type(exc).__name__}")
+
+
+def _page_bounds(limit: Optional[int], offset: int) -> tuple[int, int]:
+    """Clamp pagination params and return the inclusive PostgREST ``range`` bounds."""
+    size = DEFAULT_PAGE_SIZE if limit is None else max(1, min(limit, MAX_PAGE_SIZE))
+    start = max(0, offset)
+    return start, start + size - 1
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     started = time.perf_counter()
@@ -226,11 +249,14 @@ async def lifespan(app: FastAPI):
 
     # Launch auto-close background loop
     task = asyncio.create_task(_session_auto_close_loop())
+    preload_task = asyncio.create_task(_preload_face_engine()) if PRELOAD_FACE_ENGINE else None
     logger.info(
         f"[LIFECYCLE] startup_complete duration_ms={(time.perf_counter() - started) * 1000.0:.1f} "
-        f"face_engine=lazy env={ATTENDANCE_ENV}"
+        f"face_engine={'preloading' if preload_task else 'lazy'} env={ATTENDANCE_ENV}"
     )
     yield
+    if preload_task is not None and not preload_task.done():
+        preload_task.cancel()
     task.cancel()
     try:
         await task
@@ -1220,14 +1246,20 @@ def class_students(class_id: str, user: dict[str, Any] = Depends(current_user)) 
 
 # ── Routes: Sessions Lifecycle ────────────────────────────────────────────────
 @app.get("/api/sessions")
-def sessions(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+def sessions(
+    user: dict[str, Any] = Depends(current_user),
+    limit: Optional[int] = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict[str, Any]]:
     now_iso = utc_now()
+    start, end = _page_bounds(limit, offset)
     if user["role"] in ("controller", "admin"):
         resp = (
             supa()
             .table("sessions")
             .select("*, classes(name, code, teacher_id)")
             .order("created_at", desc=True)
+            .range(start, end)
             .execute()
         )
     elif user["role"] == "teacher":
@@ -1241,6 +1273,7 @@ def sessions(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any
             .select("*, classes(name, code, teacher_id)")
             .in_("class_id", class_ids)
             .order("created_at", desc=True)
+            .range(start, end)
             .execute()
         )
     else:
@@ -1254,6 +1287,7 @@ def sessions(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any
             .select("*, classes(name, code), attendance(status, note)")
             .in_("class_id", class_ids)
             .order("created_at", desc=True)
+            .range(start, end)
             .execute()
         )
     rows = []
@@ -1463,24 +1497,17 @@ def _session_payload(row: dict[str, Any], user: dict[str, Any]) -> dict[str, Any
         "total": len(entries),
     }
 
-    # Verified headline count for live screen
-    verified_attempts = (
+    # Verified/flagged headline counts for the live screen in one round trip.
+    attempt_states = (
         db.table("checkin_attempts")
-        .select("id", count="exact")
+        .select("state")
         .eq("session_id", session_id)
-        .eq("state", "verified")
+        .in_("state", ["verified", "flagged"])
         .execute()
-    )
-    counts["verified_count"] = verified_attempts.count or counts["present"]
-
-    flagged_attempts = (
-        db.table("checkin_attempts")
-        .select("id", count="exact")
-        .eq("session_id", session_id)
-        .eq("state", "flagged")
-        .execute()
-    )
-    counts["flagged_count"] = flagged_attempts.count or 0
+    ).data or []
+    verified_count = sum(1 for a in attempt_states if a.get("state") == "verified")
+    counts["verified_count"] = verified_count or counts["present"]
+    counts["flagged_count"] = sum(1 for a in attempt_states if a.get("state") == "flagged")
 
     return {
         "id": row["id"],
@@ -3535,8 +3562,12 @@ def controller_import_registry(
 
 @app.get("/api/audit")
 def get_audit(
-    session_id: Optional[str] = Query(default=None), user: dict[str, Any] = Depends(current_user)
+    session_id: Optional[str] = Query(default=None),
+    user: dict[str, Any] = Depends(current_user),
+    limit: Optional[int] = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
 ) -> list[dict[str, Any]]:
+    start, end = _page_bounds(limit, offset)
     if user.get("role") not in ("teacher", "controller", "admin"):
         raise HTTPException(status_code=403, detail="Lecturer or Controller access required")
     db = supa()
@@ -3547,7 +3578,8 @@ def get_audit(
             db.table("audit_log")
             .select("*, profiles(id, name)")
             .eq("session_id", session_id)
-            .order("id", desc=True)
+            .order("timestamp", desc=True)
+            .range(start, end)
             .execute()
         )
     else:
@@ -3555,7 +3587,8 @@ def get_audit(
             resp = (
                 db.table("audit_log")
                 .select("*, profiles(id, name)")
-                .order("id", desc=True)
+                .order("timestamp", desc=True)
+                .range(start, end)
                 .execute()
             )
         else:
@@ -3571,7 +3604,8 @@ def get_audit(
                 db.table("audit_log")
                 .select("*, profiles(id, name)")
                 .in_("session_id", session_ids)
-                .order("id", desc=True)
+                .order("timestamp", desc=True)
+                .range(start, end)
                 .execute()
             )
     result = []
@@ -3837,13 +3871,19 @@ def export_master_analytics_excel(user: dict[str, Any] = Depends(current_user)) 
 
 
 @app.get("/api/notifications")
-def notifications(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
+def notifications(
+    user: dict[str, Any] = Depends(current_user),
+    limit: Optional[int] = Query(default=None, ge=1),
+    offset: int = Query(default=0, ge=0),
+) -> list[dict[str, Any]]:
+    start, end = _page_bounds(limit, offset)
     resp = (
         supa()
         .table("notifications")
         .select("id, type, title, body, session_id, created_at, read_at")
         .eq("user_id", user["id"])
         .order("created_at", desc=True)
+        .range(start, end)
         .execute()
     )
     return resp.data or []
