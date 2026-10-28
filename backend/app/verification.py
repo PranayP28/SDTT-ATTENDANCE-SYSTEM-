@@ -543,11 +543,10 @@ class VerificationPipeline:
             if not faces:
                 continue
             for candidate in faces:
-                if student_enrolled_embedding is not None:
-                    candidate_emb = self.engine.extract_embedding(f.img_bgr, candidate)
-                    sim = self.engine.compute_similarity(candidate_emb, student_enrolled_embedding)
-                else:
-                    sim = 0.88
+                if student_enrolled_embedding is None:
+                    continue
+                candidate_emb = self.engine.extract_embedding(f.img_bgr, candidate)
+                sim = self.engine.compute_similarity(candidate_emb, student_enrolled_embedding)
 
                 if sim > best_self_similarity:
                     best_self_similarity = sim

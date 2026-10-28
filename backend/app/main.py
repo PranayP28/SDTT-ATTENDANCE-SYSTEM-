@@ -62,7 +62,7 @@ from app.config import (
     WS_TICKET_TTL_SECONDS,
     validate_environment_config,
 )
-from app.db import supa, utc_now
+from app.db import first_row, is_supabase_backend, supa, utc_now
 from app.face_engine import FaceDetection, get_face_engine
 from app.observability import (
     InferenceBusyError,
@@ -578,8 +578,8 @@ def _close_session_internal(sess: dict[str, Any]) -> None:
     session_id = sess["id"]
     db = supa()
     # Check if already closed
-    current = db.table("sessions").select("status").eq("id", session_id).single().execute()
-    if current.data and current.data.get("status") != "open":
+    current = first_row(db.table("sessions").select("status").eq("id", session_id))
+    if current and current.get("status") != "open":
         return
 
     db.table("sessions").update({"status": "closed"}).eq("id", session_id).execute()
@@ -932,6 +932,12 @@ def signup(req: SignupRequest) -> dict[str, Any]:
         new_id = auth_res.user.id
     except Exception as auth_err:
         logger.warning(f"Supabase auth create_user: {auth_err}")
+        if is_supabase_backend():
+            raise HTTPException(
+                status_code=400,
+                detail="Account could not be created. Check the email and password and try again. [SIGNUP_FAILED]",
+                headers={"X-Error-Code": "SIGNUP_FAILED"},
+            )
 
     # Ensure profile row exists
     prof = None
@@ -944,8 +950,12 @@ def signup(req: SignupRequest) -> dict[str, Any]:
             ins = supa().table("profiles").insert(new_prof).execute()
             prof = ins.data[0] if ins.data else new_prof
     except Exception as e:
-        logger.warning(f"Profile creation: {e}")
-        prof = {"id": new_id, "name": display_name, "email": email, "role": db_role}
+        logger.error(f"Profile creation failed for new account: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Account profile could not be saved. Please try again later. [PROFILE_CREATE_FAILED]",
+            headers={"X-Error-Code": "PROFILE_CREATE_FAILED"},
+        )
 
     token = create_access_token(
         user_id=prof["id"],
@@ -1178,7 +1188,7 @@ def delete_own_enrollment(user: dict[str, Any] = Depends(current_user)) -> dict[
 # ── Routes: Classes ───────────────────────────────────────────────────────────
 @app.get("/api/classes")
 def classes(user: dict[str, Any] = Depends(current_user)) -> list[dict[str, Any]]:
-    if user["role"] == "controller":
+    if user["role"] in ("controller", "admin"):
         resp = supa().table("classes").select("*").order("name").execute()
     elif user["role"] == "teacher":
         resp = supa().table("classes").select("*").eq("teacher_id", user["id"]).order("name").execute()
@@ -1492,6 +1502,18 @@ def _session_payload(row: dict[str, Any], user: dict[str, Any]) -> dict[str, Any
     }
 
 
+def _load_reference_embedding(db: Any, user_id: str) -> Optional[np.ndarray]:
+    """Return the decrypted reference embedding for ``user_id`` or ``None`` if absent/unreadable."""
+    tmpl = first_row(db.table("face_templates").select("encrypted_embedding").eq("user_id", user_id))
+    if not tmpl or not tmpl.get("encrypted_embedding"):
+        return None
+    try:
+        return decrypt_face_embedding(tmpl["encrypted_embedding"])
+    except Exception as exc:
+        logger.warning(f"Unreadable biometric template for user {user_id}: {type(exc).__name__}")
+        return None
+
+
 # ── Routes: Continuous Front-Camera Sweep Check-in ────────────────────────────
 @app.post("/api/sessions/{session_id}/checkin")
 def student_sweep_checkin(
@@ -1540,28 +1562,16 @@ def student_sweep_checkin(
 
     # Retrieve student reference face embedding
     db = supa()
-    st_template = (
-        db.table("face_templates")
-        .select("encrypted_embedding")
-        .eq("user_id", user["id"])
-        .single()
-        .execute()
-    )
-    st_emb = None
-    if st_template.data:
-        st_emb = decrypt_face_embedding(st_template.data["encrypted_embedding"])
+    st_emb = _load_reference_embedding(db, user["id"])
+    if st_emb is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Biometrics not enrolled. You must register your face reference before marking attendance. [MISSING_ENROLLMENT_DATA]",
+            headers={"X-Error-Code": "MISSING_ENROLLMENT_DATA"},
+        )
 
-    # Retrieve lecturer reference face embedding
-    lec_template = (
-        db.table("face_templates")
-        .select("encrypted_embedding")
-        .eq("user_id", row.get("teacher_id"))
-        .single()
-        .execute()
-    )
-    lec_emb = None
-    if lec_template.data:
-        lec_emb = decrypt_face_embedding(lec_template.data["encrypted_embedding"])
+    # Lecturer reference is optional; without it Rule 7 falls back to presence checks.
+    lec_emb = _load_reference_embedding(db, row.get("teacher_id")) if row.get("teacher_id") else None
 
     # Execute 9-Rule Verification Pipeline inside the process-wide inference
     # gate. The gate is released before any attendance write occurs.
@@ -1742,18 +1752,23 @@ def review_decision(
     _assert_session_access(row, user, teacher_only=True)
 
     db = supa()
-    attempt = (
+    if row["status"] == "finalized":
+        raise HTTPException(status_code=409, detail="Finalized sessions cannot be modified")
+
+    att_row = first_row(
         db.table("checkin_attempts")
         .select("*")
         .eq("session_id", session_id)
         .eq("attempt_id", attempt_id)
-        .single()
-        .execute()
     )
-    if not attempt.data:
+    if not att_row:
         raise HTTPException(status_code=404, detail="Checkin attempt not found.")
+    if att_row.get("state") != "flagged":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Only flagged attempts can be reviewed; this attempt is already {att_row.get('state')}.",
+        )
 
-    att_row = attempt.data
     student_id = att_row["student_id"]
     is_accepted = body.decision in ("verified", "accept")
     new_status = "present" if is_accepted else "absent"
@@ -2088,7 +2103,7 @@ def export_session_excel(
     for e in att.data or []:
         flat = {**e}
         sid = e.get("student_id")
-        prof = db.table("profiles").select("name, email, roll_number").eq("id", sid).single().execute().data or {}
+        prof = first_row(db.table("profiles").select("name, email, roll_number").eq("id", sid)) or {}
         flat["name"] = prof.get("name") or e.get("name", "Student")
         flat["email"] = prof.get("email") or e.get("email", "")
         flat["roll_number"] = prof.get("roll_number") or (sid[:8] if sid else "—")
@@ -2254,7 +2269,7 @@ def analyze_classroom_panorama(
     faces = engine.detect_faces(img_room, allow_fallback=False)
 
     teacher_id = class_row.get("teacher_id")
-    teacher_prof = db.table("profiles").select("name").eq("id", teacher_id).single().execute().data if teacher_id else None
+    teacher_prof = first_row(db.table("profiles").select("name").eq("id", teacher_id)) if teacher_id else None
     teacher_name = teacher_prof.get("name", "Sir (Lecturer)") if teacher_prof else "Sir (Lecturer)"
 
     # Genuine empty room check: If 0 human faces are detected in the entire panorama
@@ -2465,15 +2480,14 @@ def verify_student_live_attendance(
             expected_challenges = token_payload.get("challenges", [])
 
         # 2. Check face template enrollment & validate integrity
-        ft_resp = db.table("face_templates").select("*").eq("user_id", user["id"]).single().execute()
-        if not ft_resp.data:
+        tmpl_row = first_row(db.table("face_templates").select("*").eq("user_id", user["id"]))
+        if not tmpl_row:
             raise HTTPException(
                 status_code=400,
                 detail="Biometrics not enrolled. You must register your face reference on first sign-in before marking attendance.",
                 headers={"X-Error-Code": "MISSING_ENROLLMENT_DATA"},
             )
 
-        tmpl_row = ft_resp.data
 
         # Check expiration timestamp if configured
         expires_at_str = tmpl_row.get("expires_at")
@@ -2705,7 +2719,7 @@ def verify_student_live_attendance(
                     face_decision_note = f"Biometric mismatch: Scanned face does not match your registered reference (Confidence: {int(similarity * 100)}%)."
 
                 # 8. Classroom panorama verification
-                class_row = db.table("classes").select("*").eq("id", sess.get("class_id")).single().execute().data or {}
+                class_row = first_row(db.table("classes").select("*").eq("id", sess.get("class_id"))) or {}
                 capacity = int(class_row.get("capacity") or 120)
                 hall_type = class_row.get("hall_type") or f"{capacity}-Seater Hall"
                 expected_room = class_row.get("room_number") or f"LH-{capacity}"
@@ -3037,7 +3051,7 @@ def controller_get_classes(user: dict[str, Any] = Depends(current_user)) -> list
         enr = db.table("enrollments").select("student_id").eq("class_id", c["id"]).execute().data or []
         c["student_count"] = len(enr)
         if c.get("teacher_id"):
-            t = db.table("profiles").select("name").eq("id", c["teacher_id"]).single().execute().data
+            t = first_row(db.table("profiles").select("name").eq("id", c["teacher_id"]))
             c["teacher_name"] = t.get("name") if t else "Unassigned"
         else:
             c["teacher_name"] = "Unassigned"
@@ -3856,6 +3870,7 @@ def mark_notification_read(
 
 # ── Routes: Realtime WebSockets ───────────────────────────────────────────────
 @app.post("/api/realtime/ticket")
+@app.post("/api/auth/ws-ticket")
 def create_ticket(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     ticket = secrets.token_urlsafe(32)
     expires_at = time.time() + WS_TICKET_TTL_SECONDS
@@ -3883,7 +3898,7 @@ async def websocket_endpoint(websocket: WebSocket, ticket: str = Query(...)):
     receive_task: Optional[asyncio.Task[Any]] = None
     event_task: Optional[asyncio.Task[str]] = None
     try:
-        await websocket.send_json(event_payload("connected", {"user_id": user_id}))
+        await websocket.send_text(event_payload("connected", {"user_id": user_id}))
         receive_task = asyncio.create_task(websocket.receive())
         event_task = asyncio.create_task(event_queue.get())
         while True:

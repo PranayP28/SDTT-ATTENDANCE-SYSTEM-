@@ -20,9 +20,12 @@ SUPABASE_ANON_KEY: str = os.getenv("SUPABASE_ANON_KEY", SUPABASE_SERVICE_ROLE_KE
 SUPABASE_JWT_SECRET: str = os.getenv("SUPABASE_JWT_SECRET", "test_jwt_secret_must_be_at_least_32_chars_long")
 
 # Symmetric encryption key for face biometric embeddings
-ATTENDANCE_SECRET_KEY: str = os.getenv(
-    "ATTENDANCE_SECRET_KEY",
-    "attendrix_super_secret_encryption_key_32_bytes_min!"
+# ATTENDANCE_BIOMETRIC_ENCRYPTION_KEY is the name documented in .env.example
+# and render.yaml; ATTENDANCE_SECRET_KEY takes precedence when both are set.
+ATTENDANCE_SECRET_KEY: str = (
+    os.getenv("ATTENDANCE_SECRET_KEY")
+    or os.getenv("ATTENDANCE_BIOMETRIC_ENCRYPTION_KEY")
+    or "attendrix_super_secret_encryption_key_32_bytes_min!"
 )
 
 # ── Network & Token TTL ───────────────────────────────────────────────────────

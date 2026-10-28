@@ -30,7 +30,7 @@ os.environ["SUPABASE_JWT_SECRET"] = "test_jwt_secret_must_be_at_least_32_chars_l
 import app.main as main
 from app.db import MockResponse, reset_test_db, supa
 from app.observability import InferenceBusyError
-from app.security import create_access_token
+from app.security import create_access_token, encrypt_face_embedding
 
 STUDENT_ID = "00000000-0000-0000-0000-000000000002"
 CLASS_ID = "11111111-1111-1111-1111-111111111111"
@@ -174,6 +174,9 @@ def test_inference_busy_returns_503_without_writing_attendance(monkeypatch):
         yield  # pragma: no cover
 
     monkeypatch.setattr(main, "inference_slot", _busy_slot)
+    supa().table("face_templates").insert(
+        {"user_id": STUDENT_ID, "encrypted_embedding": encrypt_face_embedding(np.ones(512, dtype=np.float32))}
+    ).execute()
     token = create_access_token(STUDENT_ID, "student1@demo.edu", "student", "Ada Lovelace")
 
     with TestClient(main.app) as client:
